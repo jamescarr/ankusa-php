@@ -89,9 +89,9 @@ needs exactly one bit to decide dead-letter vs. retry:
 | --- | --- | --- |
 | `InvalidClaimRefError` | `false` | `$ref` isn't a well-formed claim-check URN, or `$sha256` isn't 64-char lowercase hex |
 | `ClaimNotFoundError` | `false` | gateway `404`: expired by retention, or never written |
-| `ClaimRejectedError` | `false` | gateway `4xx` other than `404` (public `$status`, `$body`) |
+| `ClaimRejectedError` | `false` | gateway `4xx` other than `404`, `408`, `429` (public `$status`, `$body`) |
 | `ClaimIntegrityError` | `false` | sha256 of the returned bytes doesn't match |
-| `ClaimCheckUnavailableError` | `true` | gateway `5xx`/`503`, or unreachable |
+| `ClaimCheckUnavailableError` | `true` | gateway `5xx`, `408`, `429`, or unreachable |
 
 `health()` hits `GET /health` for a liveness probe.
 
@@ -116,13 +116,106 @@ try {
 }
 
 $body = file_get_contents('php://input');
-// $hook->id, $hook->source, $hook->tenant, $hook->contentType
+// $hook->id, $hook->source, $hook->tenant, $hook->contentType, $hook->idempotencyKey
 ```
 
-`HookHeaders->id` is what a receiver dedupes on: delivery is at-least-once (see
-"HTTP handoff" in
+`HookHeaders->id` is what a receiver identifies a delivery by: delivery is
+at-least-once (see "HTTP handoff" in
 [docs/integrations.md](https://github.com/jamescarr/ankusa/blob/main/docs/integrations.md)),
-so the same hook can arrive twice after a retry.
+so the same hook can arrive twice after a retry. Dedupe on
+`$hook->idempotencyKey()`: it returns the tenant-scoped key Ankusa shipped in
+`x-ankusa-idempotency-key` (`$hook->idempotencyKey` is the parsed header, `null`
+for a sender that predates it, in which case the method computes the key).
+
+### Verifying signed deliveries
+
+An HTTP sink with a `secret` signs every delivery the
+[Standard Webhooks](https://www.standardwebhooks.com/) way:
+
+```php
+use Ankusa\Webhook\InvalidSignatureError;
+use Ankusa\Webhook\Signature;
+
+try {
+    // the raw request body, exactly as received
+    Signature::verify(getallheaders(), file_get_contents('php://input'), [getenv('ANKUSA_WHSEC')]);
+} catch (InvalidSignatureError $e) {
+    http_response_code(401);
+    echo json_encode(['error' => 'invalid_signature', 'code' => $e->errorCode]);
+    exit;
+}
+```
+
+Secrets are `whsec_` + base64, or any other string used as its own bytes;
+pass several during a rotation. `$toleranceSeconds` (default 300) bounds the
+`webhook-timestamp` window. Signatures are compared with `hash_equals`;
+failures carry `$errorCode` and `$field`, never retryable.
+
+## Consuming queue messages
+
+A queue consumer (Redis or a broker; the HTTP sink sends the original body
+plus `x-ankusa-*` headers, read with `HookHeaders`) decodes one v1
+message, verifies its integrity, and reads the key it dedupes on before it
+touches the effect. `Message::decode()` is the whole decoder — it refuses
+anything that doesn't verify, so a decoded message is safe to act on:
+
+```php
+use Ankusa\Message\Message;
+use Ankusa\Message\InvalidMessageError;
+
+try {
+    $message = Message::decode($payload);
+} catch (InvalidMessageError $err) {
+    // never retryable: dead-letter it
+    error_log("bad message: {$err->errorCode} " . ($err->field ?? ''));
+    return;
+}
+
+$body = $message->body ?? $claimCheck->redeem($message->claim, $message->sha256);
+$key  = $message->idempotencyKey();
+```
+
+`idempotencyKey()` returns the key Ankusa computed once for the hook and shipped
+as the message's `idempotency_key` (`$message->idempotencyKey` is that field):
+`tenant:source_id:dedupe_key` when the provider event key is present, else the
+`id`; delivery is at-least-once, so this is the stable handle when a provider
+retries, and two tenants that share a provider event id keep distinct keys. For
+a message from a node that predates the field the method computes the same key
+itself (tenant `default` when there is none). It ignores `replay_id` by
+default — a replayed event you already processed stays deduped. A consumer that
+must reprocess replays calls `idempotencyKey(includeReplay: true)`, which
+appends `#replay:<replay_id>`.
+
+The key is meant to be a row in a processed-ids table, written with the effect:
+
+```sql
+CREATE TABLE processed_webhooks (
+    idempotency_key text PRIMARY KEY,
+    ankusa_id       text        NOT NULL,
+    processed_at    timestamptz NOT NULL DEFAULT now()
+);
+```
+
+```php
+$stmt = $pdo->prepare(
+    'INSERT INTO processed_webhooks (idempotency_key, ankusa_id) VALUES (:key, :id)
+     ON CONFLICT (idempotency_key) DO NOTHING'
+);
+$stmt->execute(['key' => $key, 'id' => $message->id]);
+
+if ($stmt->rowCount() === 0) {
+    return; // already processed this provider event
+}
+
+// ... apply the effect, in the same transaction ...
+```
+
+A raw `HookHeaders` (the HTTP sink's headers) answers the same method, so a
+receiver and a queue consumer share one dedupe rule:
+
+```php
+$key = HookHeaders::fromHeaders(getallheaders())->idempotencyKey();
+```
 
 ## Routes client
 
@@ -157,8 +250,8 @@ non-JSON success body, or unreachable; retryable).
 ## Admin client
 
 The operator API on `admin.port` (default 4002): health, Prometheus metrics,
-the redacted config, the DLQ, and the quarantine list — the `operations`, `dlq`
-and `quarantine` tags of `admin.v1.yaml`.
+the redacted config, the DLQ, replay jobs, and the quarantine list — the
+`operations`, `dlq`, `replays` and `quarantine` tags of `admin.v1.yaml`.
 
 ```php
 use Ankusa\Admin\AdminClient;
@@ -167,14 +260,22 @@ $admin = new AdminClient(getenv('ADMIN_URL') ?: 'http://localhost:4002');
 
 $admin->health();                          // ['status' => 'ok', 'instance' => ..., 'roles' => [...]]
 $admin->listDeadLetters(['limit' => 10]);  // ['total' => ..., 'entries' => [...]]
-$admin->replayDeadLetters(['source_id' => 'demo']);
 $admin->listQuarantined();
+
+// Replay jobs. A job is node-local, so a fleet replay is one job per node:
+$job = $admin->createReplay(['kind' => 'dlq', 'source_id' => 'demo', 'rate' => 500]);
+$admin->getReplay($job['id']);              // the Replay object
+$admin->listReplays();                      // ['replays' => [...]], newest first
+$admin->updateReplay($job['id'], ['state' => 'paused']);  // or 'running'/'cancelled'
 ```
 
-Methods: `health()`, `metrics()` (Prometheus text), `config()`,
-`listDeadLetters()`, `replayDeadLetters()`, `listQuarantined()`. Failures are
-`AdminError` subclasses: `RoleNotEnabledError` (409 `role_not_enabled`,
-carrying `$role`), `AdminRejectedError` (any other 4xx, carrying `$errorCode`),
+`createReplay()` returns the created job (HTTP 202) or, when an equivalent job
+is already running or paused, that job (HTTP 200) — so a proxy retry is
+idempotent. Methods: `health()`, `metrics()` (Prometheus text), `config()`,
+`listDeadLetters()`, `createReplay()`, `getReplay()`, `listReplays()`,
+`updateReplay()`, `listQuarantined()`. Failures are `AdminError` subclasses:
+`RoleNotEnabledError` (409 `role_not_enabled`, carrying `$role`),
+`AdminRejectedError` (any other 4xx, carrying `$errorCode`),
 and `AdminUnavailableError` (5xx, an unfollowed redirect, or unreachable;
 retryable).
 
@@ -237,9 +338,10 @@ raises `SourceInvalidError` before a path is built.
   throws on a status code; an injected client owns its own timeout and redirect
   policy, though the SDK still treats any `3xx` as a failure. Client headers
   ride on every request.
-- Request bodies are JSON objects: `replayDeadLetters()` with no filter sends
-  `{}`, never `[]`. Nested empty objects are the caller's job — pass
-  `(object) []` for a nested `{}`, or `[]` for a nested `[]`.
+- Request bodies are JSON objects: `createReplay()` and `updateReplay()` send
+  the spec/patch they're given, never `[]`. Nested empty objects are the
+  caller's job — pass `(object) []` for a nested `{}`, or `[]` for a nested
+  `[]`.
 
 ## Layout
 
@@ -249,6 +351,7 @@ src/
   Version.php              # the version the release tooling reads
   Internal/HttpTransport.php  # @internal: query/body encoding + PSR-18 call
   Webhook/                 # x-ankusa-* header parsing for HTTP-sink receivers
+  Message/                 # v1 queue-message decoding + idempotency key
   ClaimCheck/              # the claim-check gateway client
   Routes/                  # the route-management client (routes.admin.port)
   Admin/                   # the operator client (admin.port)

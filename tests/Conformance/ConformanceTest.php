@@ -16,6 +16,8 @@ use Ankusa\ClaimCheck\ClaimNotFoundError;
 use Ankusa\ClaimCheck\ClaimRejectedError;
 use Ankusa\ClaimCheck\InvalidClaimRefError;
 use Ankusa\ClaimCheck\ParsedClaimRef;
+use Ankusa\Message\InvalidMessageError;
+use Ankusa\Message\Message;
 use Ankusa\Routes\InvalidRouteIdError;
 use Ankusa\Routes\RouteNotFoundError;
 use Ankusa\Routes\RoutesClient;
@@ -24,7 +26,9 @@ use Ankusa\Routes\RoutesRejectedError;
 use Ankusa\Routes\RoutesUnavailableError;
 use Ankusa\Tests\Support\RecordingHttpClient;
 use Ankusa\Webhook\HookHeaders;
+use Ankusa\Webhook\InvalidSignatureError;
 use Ankusa\Webhook\MissingHookIdError;
+use Ankusa\Webhook\Signature;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
@@ -51,6 +55,8 @@ final class ConformanceTest extends TestCase
         'ClaimIntegrityError' => ClaimIntegrityError::class,
         'ClaimCheckUnavailableError' => ClaimCheckUnavailableError::class,
         'MissingHookIdError' => MissingHookIdError::class,
+        'InvalidSignatureError' => InvalidSignatureError::class,
+        'InvalidMessageError' => InvalidMessageError::class,
         'RoutesError' => RoutesError::class,
         'InvalidRouteIdError' => InvalidRouteIdError::class,
         'RoutesUnavailableError' => RoutesUnavailableError::class,
@@ -226,6 +232,13 @@ final class ConformanceTest extends TestCase
         return match ($operation) {
             'parse_claim_ref' => self::parsedClaimRef($inp),
             'parse_headers' => self::hookHeaders($inp),
+            'verify_signature' => Signature::verify(
+                self::stringMap($inp['headers'] ?? null),
+                self::bodyBytes($inp['body'] ?? null),
+                self::secrets($inp),
+                \array_key_exists('tolerance_seconds', $inp) ? self::int($inp, 'tolerance_seconds') : Signature::DEFAULT_TOLERANCE_SECONDS,
+                self::int($inp, 'now'),
+            ),
             'redeem' => self::redeem($inp, $conn),
             'health' => self::claimCheck($conn)->health(),
             'routes_health' => self::routes($conn)->health(),
@@ -242,8 +255,13 @@ final class ConformanceTest extends TestCase
             'admin_metrics' => ['text' => self::admin($conn)->metrics()],
             'admin_config' => self::admin($conn)->config(),
             'admin_dlq_list' => self::admin($conn)->listDeadLetters(self::scalars($inp, 'params')),
-            'admin_dlq_replay' => self::admin($conn)->replayDeadLetters(self::object($inp['filter'] ?? null, 'filter')),
             'admin_quarantine' => self::admin($conn)->listQuarantined(self::scalars($inp, 'params')),
+            'admin_replay_create' => self::admin($conn)->createReplay(self::object($inp['spec'] ?? null, 'spec')),
+            'admin_replay_get' => self::admin($conn)->getReplay(self::string($inp, 'id')),
+            'admin_replay_list' => self::admin($conn)->listReplays(),
+            'admin_replay_update' => self::admin($conn)->updateReplay(self::string($inp, 'id'), self::object($inp['patch'] ?? null, 'patch')),
+            'decode_message' => self::decodeMessage($inp),
+            'idempotency_key' => self::idempotencyKey($inp),
             default => self::fail("unknown conformance operation {$operation}"),
         };
     }
@@ -323,7 +341,7 @@ final class ConformanceTest extends TestCase
     /**
      * @param array<string, mixed> $inp
      *
-     * @return array{id: string, source: string, tenant: string|null, content_type: string|null}
+     * @return array{id: string, source: string, tenant: string|null, content_type: string|null, dedupe_key: string|null, replay_id: string|null, idempotency_key: string|null}
      */
     private static function hookHeaders(array $inp): array
     {
@@ -334,7 +352,53 @@ final class ConformanceTest extends TestCase
             'source' => $headers->source,
             'tenant' => $headers->tenant,
             'content_type' => $headers->contentType,
+            'dedupe_key' => $headers->dedupeKey,
+            'replay_id' => $headers->replayId,
+            'idempotency_key' => $headers->idempotencyKey,
         ];
+    }
+
+    /**
+     * @param array<string, mixed> $inp
+     *
+     * @return array<string, mixed>
+     */
+    private static function decodeMessage(array $inp): array
+    {
+        $message = Message::decode(self::string($inp, 'message'));
+        $body = $message->body;
+
+        return [
+            'v' => $message->v,
+            'id' => $message->id,
+            'source_id' => $message->sourceId,
+            'tenant_id' => $message->tenantId,
+            'received_at' => $message->receivedAt,
+            'content_type' => $message->contentType,
+            'size' => $message->size,
+            'body_base64' => $body === null ? null : base64_encode($body),
+            'claim' => $message->claim,
+            'sha256' => $message->sha256,
+            'dedupe_key' => $message->dedupeKey,
+            'replay_id' => $message->replayId,
+            'idempotency_key' => $message->idempotencyKey,
+            'headers' => $message->headers,
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $inp
+     *
+     * @return array{key: string}
+     */
+    private static function idempotencyKey(array $inp): array
+    {
+        $includeReplay = ($inp['include_replay'] ?? null) === true;
+        $hook = \array_key_exists('headers', $inp)
+            ? HookHeaders::fromHeaders(self::stringMap($inp['headers'] ?? null))
+            : Message::decode(self::string($inp, 'message'));
+
+        return ['key' => $hook->idempotencyKey($includeReplay)];
     }
 
     /**
@@ -661,6 +725,24 @@ final class ConformanceTest extends TestCase
         }
 
         return $map;
+    }
+
+    /**
+     * @param array<string, mixed> $inp
+     *
+     * @return list<string>
+     */
+    private static function secrets(array $inp): array
+    {
+        $secrets = [];
+        foreach (\is_array($inp['secrets'] ?? null) ? $inp['secrets'] : [] as $secret) {
+            if (!\is_string($secret)) {
+                self::fail('input.secrets has a non-string entry: ' . self::show($inp['secrets']));
+            }
+            $secrets[] = $secret;
+        }
+
+        return $secrets;
     }
 
     /**
