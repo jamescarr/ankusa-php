@@ -32,6 +32,10 @@ final readonly class HookHeaders
         'x-ankusa-replay-id',
         'x-ankusa-idempotency-key',
         'content-type',
+        'x-ankusa-verification',
+        'x-ankusa-verification-flagged',
+        'x-ankusa-received-at',
+        'x-ankusa-body-sha256',
     ];
 
     public function __construct(
@@ -50,6 +54,20 @@ final readonly class HookHeaders
          * that predates the header). Read it through {@see self::idempotencyKey()}.
          */
         public ?string $idempotencyKey,
+        /** How Ankusa verified the hook at ingest; `null` when absent or empty. */
+        public ?Verification $verification = null,
+        /**
+         * When the edge accepted the hook, unix milliseconds, from
+         * `x-ankusa-received-at`; `null` when absent, empty or not 1 to 15
+         * decimal digits (advisory: never an error).
+         */
+        public ?int $receivedAt = null,
+        /**
+         * The lowercase hex SHA-256 of the body Ankusa sent, from
+         * `x-ankusa-body-sha256`; `null` when absent or not exactly 64
+         * lowercase hex characters (advisory: never an error).
+         */
+        public ?string $bodySha256 = null,
     ) {}
 
     /**
@@ -93,7 +111,44 @@ final readonly class HookHeaders
             dedupeKey: self::optional($lowered['x-ankusa-dedupe-key'] ?? null),
             replayId: self::optional($lowered['x-ankusa-replay-id'] ?? null),
             idempotencyKey: self::optional($lowered['x-ankusa-idempotency-key'] ?? null),
+            verification: self::parseVerification($lowered),
+            receivedAt: self::parseReceivedAt($lowered['x-ankusa-received-at'] ?? null),
+            bodySha256: self::parseBodySha256($lowered['x-ankusa-body-sha256'] ?? null),
         );
+    }
+
+    /**
+     * Whether the node verified this delivery at ingest and nothing flags it
+     * (see {@see Verification::isTrusted()}). A delivery with no
+     * `x-ankusa-verification` header (a node older than the field) is
+     * untrusted.
+     */
+    public function isTrusted(): bool
+    {
+        return $this->verification?->isTrusted() === true;
+    }
+
+    /**
+     * @param array<string, string|null> $lowered
+     */
+    private static function parseVerification(array $lowered): ?Verification
+    {
+        $status = self::optional($lowered['x-ankusa-verification'] ?? null);
+        if ($status === null) {
+            return null;
+        }
+
+        return new Verification($status, ($lowered['x-ankusa-verification-flagged'] ?? null) === 'true');
+    }
+
+    private static function parseReceivedAt(?string $value): ?int
+    {
+        return $value !== null && preg_match('/\A[0-9]{1,15}\z/', $value) === 1 ? (int) $value : null;
+    }
+
+    private static function parseBodySha256(?string $value): ?string
+    {
+        return $value !== null && preg_match('/\A[0-9a-f]{64}\z/', $value) === 1 ? $value : null;
     }
 
     /**

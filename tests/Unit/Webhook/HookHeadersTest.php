@@ -6,6 +6,7 @@ namespace Ankusa\Tests\Unit\Webhook;
 
 use Ankusa\Webhook\HookHeaders;
 use Ankusa\Webhook\MissingHookIdError;
+use Ankusa\Webhook\Verification;
 use GuzzleHttp\Psr7\ServerRequest;
 use PHPUnit\Framework\TestCase;
 
@@ -97,6 +98,35 @@ final class HookHeadersTest extends TestCase
         self::assertSame('', $headers->source);
         self::assertNull($headers->tenant);
         self::assertNull($headers->contentType);
+    }
+
+    public function testReadsWhenTheEdgeAcceptedTheHookAndTheBodySha256(): void
+    {
+        $sha256 = '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824';
+        $request = new ServerRequest('POST', 'https://hooks.test/inbound', [
+            'x-ankusa-id' => '01a0',
+            'X-Ankusa-Received-At' => '1720000000000',
+            'x-ankusa-body-sha256' => $sha256,
+        ]);
+
+        foreach ([$request, ['x-ankusa-id' => '01a0', 'x-ankusa-received-at' => '1720000000000', 'x-ankusa-body-sha256' => $sha256]] as $source) {
+            $headers = HookHeaders::fromHeaders($source);
+
+            self::assertSame(1_720_000_000_000, $headers->receivedAt);
+            self::assertSame($sha256, $headers->bodySha256);
+        }
+    }
+
+    public function testMalformedDeliveryMetadataIsNull(): void
+    {
+        $headers = HookHeaders::fromHeaders([
+            'x-ankusa-id' => '01a0',
+            'x-ankusa-received-at' => '-1',
+            'x-ankusa-body-sha256' => 'ABC',
+        ]);
+
+        self::assertNull($headers->receivedAt);
+        self::assertNull($headers->bodySha256);
     }
 
     public function testMissingIdIsRejected(): void
@@ -193,6 +223,43 @@ final class HookHeadersTest extends TestCase
 
         self::assertSame('acme:stripe:evt_1', $headers->idempotencyKey());
         self::assertSame('acme:stripe:evt_1#replay:rid-1', $headers->idempotencyKey(true));
+    }
+
+    public function testVerificationIsNullWhenAbsent(): void
+    {
+        $headers = HookHeaders::fromHeaders(['x-ankusa-id' => '01a0', 'x-ankusa-source' => 'stripe']);
+
+        self::assertNull($headers->verification);
+    }
+
+    public function testVerificationFlaggedHeaderIsTrue(): void
+    {
+        $headers = HookHeaders::fromHeaders([
+            'x-ankusa-id' => '01a0',
+            'x-ankusa-verification' => 'failed',
+            'x-ankusa-verification-flagged' => 'true',
+        ]);
+
+        self::assertInstanceOf(Verification::class, $headers->verification);
+        self::assertSame('failed', $headers->verification->status);
+        self::assertTrue($headers->verification->flagged);
+    }
+
+    public function testIsTrustedIsTrueOnlyForAnUnflaggedOk(): void
+    {
+        $ok = HookHeaders::fromHeaders(['x-ankusa-id' => '01a0', 'x-ankusa-verification' => 'ok']);
+        $flagged = HookHeaders::fromHeaders([
+            'x-ankusa-id' => '01a0',
+            'x-ankusa-verification' => 'failed',
+            'x-ankusa-verification-flagged' => 'true',
+        ]);
+        $skipped = HookHeaders::fromHeaders(['x-ankusa-id' => '01a0', 'x-ankusa-verification' => 'skipped']);
+        $legacy = HookHeaders::fromHeaders(['x-ankusa-id' => '01a0']);
+
+        self::assertTrue($ok->isTrusted());
+        self::assertFalse($flagged->isTrusted());
+        self::assertFalse($skipped->isTrusted());
+        self::assertFalse($legacy->isTrusted());
     }
 
     /* --- helpers ------------------------------------------------------------ */

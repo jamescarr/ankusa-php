@@ -7,9 +7,10 @@ namespace Ankusa\Message;
 use Ankusa\ClaimCheck\InvalidClaimRefError;
 use Ankusa\ClaimCheck\ParsedClaimRef;
 use Ankusa\Internal\IdempotencyKey;
+use Ankusa\Webhook\Verification;
 
 /**
- * One decoded v1 queue message — what an Ankusa consumer reads off Redis, a
+ * One decoded queue message — what an Ankusa consumer reads off Redis, a
  * broker, or the HTTP sink.
  *
  * {@see self::decode()} is the inverse of `Ankusa.Sink.Message.encode/3`. It
@@ -30,11 +31,13 @@ use Ankusa\Internal\IdempotencyKey;
  * The rules, in order, first failure wins:
  *
  * 1. not JSON -> `invalid_json`; JSON that isn't an object -> `not_an_object`.
- * 2. `v` missing or not the integer 1 -> `unsupported_version`.
+ * 2. `v` missing or not an integer from {@see self::MIN_SUPPORTED_VERSION} to
+ *    {@see self::MAX_SUPPORTED_VERSION} (1 and 2) -> `unsupported_version`.
  * 3. field types -> `invalid_field` with `field` set to the key: `id` a
  *    non-empty string; `source_id` a string; `received_at` an integer; `size`
  *    an integer >= 0; `tenant_id`/`content_type`/`dedupe_key`/`replay_id`/
- *    `idempotency_key` a string, null, or absent; `headers` absent or an object
+ *    `idempotency_key`/`traceparent`/`tracestate`/`instance`/`region` a string,
+ *    null, or absent, in that order; `headers` absent or an object
  *    of strings; `sha256` absent or 64 lowercase hex characters.
  * 4. body form: both `body_base64` and `claim` -> `ambiguous_body`; neither ->
  *    `missing_body`; invalid base64 -> `invalid_body_base64`; an unparsable
@@ -50,6 +53,21 @@ use Ankusa\Internal\IdempotencyKey;
  */
 final readonly class Message
 {
+    /**
+     * The lowest message `v` {@see self::decode()} accepts.
+     *
+     * `v` is the wire format's major version: a `v: 2` message is a `v: 1`
+     * message plus additive fields, decoded exactly like it (the keys this
+     * decoder does not know are ignored) into the one `Message` type, with
+     * `$v` as the wire said it. Raising {@see self::MAX_SUPPORTED_VERSION} is
+     * the whole change an SDK needs for a producer that starts writing the
+     * next additive version.
+     */
+    public const int MIN_SUPPORTED_VERSION = 1;
+
+    /** The highest message `v` {@see self::decode()} accepts. */
+    public const int MAX_SUPPORTED_VERSION = 2;
+
     /**
      * @param array<string, string> $headers forwarded provider headers, lowercased
      */
@@ -74,6 +92,16 @@ final readonly class Message
          */
         public ?string $idempotencyKey,
         public array $headers,
+        /** How Ankusa verified the hook at ingest; `null` from a node older than the field. */
+        public ?Verification $verification = null,
+        /** The hook's W3C `traceparent`, verbatim; continue the trace from it. `null` when the message carries none. */
+        public ?string $traceparent = null,
+        /** The W3C `tracestate` that goes with `traceparent`, verbatim; `null` when none. */
+        public ?string $tracestate = null,
+        /** The name of the Ankusa instance that published the message; `null` when it says so or predates the field. */
+        public ?string $instance = null,
+        /** The region that instance is configured with; `null` when it has none or predates the field. */
+        public ?string $region = null,
     ) {}
 
     /**
@@ -92,7 +120,7 @@ final readonly class Message
         }
 
         $v = self::field($raw, 'v');
-        if (!\is_int($v) || $v !== 1) {
+        if (!\is_int($v) || $v < self::MIN_SUPPORTED_VERSION || $v > self::MAX_SUPPORTED_VERSION) {
             throw new InvalidMessageError('unsupported message version', 'unsupported_version');
         }
 
@@ -121,6 +149,10 @@ final readonly class Message
         $dedupeKey = self::optionalString($raw, 'dedupe_key');
         $replayId = self::optionalString($raw, 'replay_id');
         $idempotencyKey = self::optionalString($raw, 'idempotency_key');
+        $traceparent = self::optionalString($raw, 'traceparent');
+        $tracestate = self::optionalString($raw, 'tracestate');
+        $instance = self::optionalString($raw, 'instance');
+        $region = self::optionalString($raw, 'region');
 
         $headers = self::headers($raw);
 
@@ -128,6 +160,8 @@ final readonly class Message
         if ($sha256 !== null && (!\is_string($sha256) || preg_match('~\A[0-9a-f]{64}\z~', $sha256) !== 1)) {
             throw new InvalidMessageError('invalid message field', 'invalid_field', 'sha256');
         }
+
+        $verification = self::verification($raw);
 
         $bodyBase64 = self::field($raw, 'body_base64');
         $claim = self::field($raw, 'claim');
@@ -166,6 +200,11 @@ final readonly class Message
                 replayId: $replayId,
                 idempotencyKey: $idempotencyKey,
                 headers: $headers,
+                verification: $verification,
+                traceparent: $traceparent,
+                tracestate: $tracestate,
+                instance: $instance,
+                region: $region,
             );
         }
 
@@ -199,6 +238,11 @@ final readonly class Message
             replayId: $replayId,
             idempotencyKey: $idempotencyKey,
             headers: $headers,
+            verification: $verification,
+            traceparent: $traceparent,
+            tracestate: $tracestate,
+            instance: $instance,
+            region: $region,
         );
     }
 
@@ -224,6 +268,16 @@ final readonly class Message
             $this->replayId,
             $includeReplay,
         );
+    }
+
+    /**
+     * Whether the node verified this message's hook at ingest and nothing
+     * flags it (see {@see Verification::isTrusted()}). A message with no
+     * `verification` (a node older than the field) is untrusted.
+     */
+    public function isTrusted(): bool
+    {
+        return $this->verification?->isTrusted() === true;
     }
 
     private static function field(\stdClass $raw, string $key): mixed
@@ -272,5 +326,24 @@ final readonly class Message
         }
 
         return $item;
+    }
+
+    private static function verification(\stdClass $raw): ?Verification
+    {
+        $value = self::field($raw, 'verification');
+        if ($value === null) {
+            return null;
+        }
+        if (!$value instanceof \stdClass) {
+            throw new InvalidMessageError('invalid message field', 'invalid_field', 'verification');
+        }
+
+        $status = property_exists($value, 'status') ? $value->status : null;
+        $flagged = property_exists($value, 'flagged') ? $value->flagged : null;
+        if (!\is_string($status) || $status === '' || !\is_bool($flagged)) {
+            throw new InvalidMessageError('invalid message field', 'invalid_field', 'verification');
+        }
+
+        return new Verification($status, $flagged);
     }
 }

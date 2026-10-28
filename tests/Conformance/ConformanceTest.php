@@ -17,6 +17,7 @@ use Ankusa\ClaimCheck\ClaimRejectedError;
 use Ankusa\ClaimCheck\InvalidClaimRefError;
 use Ankusa\ClaimCheck\ParsedClaimRef;
 use Ankusa\Message\InvalidMessageError;
+use Ankusa\Message\LifecycleEvent;
 use Ankusa\Message\Message;
 use Ankusa\Routes\InvalidRouteIdError;
 use Ankusa\Routes\RouteNotFoundError;
@@ -28,7 +29,9 @@ use Ankusa\Tests\Support\RecordingHttpClient;
 use Ankusa\Webhook\HookHeaders;
 use Ankusa\Webhook\InvalidSignatureError;
 use Ankusa\Webhook\MissingHookIdError;
+use Ankusa\Webhook\Receiver;
 use Ankusa\Webhook\Signature;
+use Ankusa\Webhook\Verification;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
@@ -83,6 +86,7 @@ final class ConformanceTest extends TestCase
         'conflicting_id' => 'conflictingId',
         'max_routes' => 'maxRoutes',
         'role' => 'role',
+        'scope' => 'scope',
     ];
 
     private static string $dir = '';
@@ -239,6 +243,7 @@ final class ConformanceTest extends TestCase
                 \array_key_exists('tolerance_seconds', $inp) ? self::int($inp, 'tolerance_seconds') : Signature::DEFAULT_TOLERANCE_SECONDS,
                 self::int($inp, 'now'),
             ),
+            'receive_delivery' => self::receivedDelivery($inp),
             'redeem' => self::redeem($inp, $conn),
             'health' => self::claimCheck($conn)->health(),
             'routes_health' => self::routes($conn)->health(),
@@ -255,6 +260,7 @@ final class ConformanceTest extends TestCase
             'admin_metrics' => ['text' => self::admin($conn)->metrics()],
             'admin_config' => self::admin($conn)->config(),
             'admin_dlq_list' => self::admin($conn)->listDeadLetters(self::scalars($inp, 'params')),
+            'admin_audit_list' => self::admin($conn)->listAudit(self::scalars($inp, 'params'))->toArray(),
             'admin_quarantine' => self::admin($conn)->listQuarantined(self::scalars($inp, 'params')),
             'admin_replay_create' => self::admin($conn)->createReplay(self::object($inp['spec'] ?? null, 'spec')),
             'admin_replay_get' => self::admin($conn)->getReplay(self::string($inp, 'id')),
@@ -262,8 +268,44 @@ final class ConformanceTest extends TestCase
             'admin_replay_update' => self::admin($conn)->updateReplay(self::string($inp, 'id'), self::object($inp['patch'] ?? null, 'patch')),
             'decode_message' => self::decodeMessage($inp),
             'idempotency_key' => self::idempotencyKey($inp),
+            'trusted' => self::trusted($inp),
+            'supported_versions' => ['min' => Message::MIN_SUPPORTED_VERSION, 'max' => Message::MAX_SUPPORTED_VERSION],
+            'decode_lifecycle' => self::decodeLifecycle($inp),
             default => self::fail("unknown conformance operation {$operation}"),
         };
+    }
+
+    /**
+     * @param array<string, mixed> $inp
+     *
+     * @return array<string, mixed>
+     */
+    private static function receivedDelivery(array $inp): array
+    {
+        $receiver = self::object($inp['receiver'] ?? null, 'receiver');
+        $received = Receiver::receive(
+            self::stringMap($inp['headers'] ?? null),
+            self::bodyBytes($inp['body'] ?? null),
+            self::secrets($receiver),
+            ($receiver['allow_unsigned'] ?? false) === true,
+            \array_key_exists('tolerance_seconds', $receiver) ? self::int($receiver, 'tolerance_seconds') : Signature::DEFAULT_TOLERANCE_SECONDS,
+            self::int($inp, 'now'),
+        );
+        $headers = $received->headers;
+
+        return [
+            'verified' => $received->verified,
+            'id' => $headers->id,
+            'source' => $headers->source,
+            'tenant' => $headers->tenant,
+            'content_type' => $headers->contentType,
+            'dedupe_key' => $headers->dedupeKey,
+            'replay_id' => $headers->replayId,
+            'idempotency_key' => $headers->idempotencyKey,
+            'received_at' => $headers->receivedAt,
+            'body_sha256' => $headers->bodySha256,
+            'verification' => self::verificationArray($headers->verification),
+        ];
     }
 
     /*
@@ -341,7 +383,7 @@ final class ConformanceTest extends TestCase
     /**
      * @param array<string, mixed> $inp
      *
-     * @return array{id: string, source: string, tenant: string|null, content_type: string|null, dedupe_key: string|null, replay_id: string|null, idempotency_key: string|null}
+     * @return array{id: string, source: string, tenant: string|null, content_type: string|null, dedupe_key: string|null, replay_id: string|null, idempotency_key: string|null, received_at: int|null, body_sha256: string|null}
      */
     private static function hookHeaders(array $inp): array
     {
@@ -355,6 +397,9 @@ final class ConformanceTest extends TestCase
             'dedupe_key' => $headers->dedupeKey,
             'replay_id' => $headers->replayId,
             'idempotency_key' => $headers->idempotencyKey,
+            'received_at' => $headers->receivedAt,
+            'body_sha256' => $headers->bodySha256,
+            'verification' => self::verificationArray($headers->verification),
         ];
     }
 
@@ -383,7 +428,48 @@ final class ConformanceTest extends TestCase
             'replay_id' => $message->replayId,
             'idempotency_key' => $message->idempotencyKey,
             'headers' => $message->headers,
+            'verification' => self::verificationArray($message->verification),
+            'traceparent' => $message->traceparent,
+            'tracestate' => $message->tracestate,
+            'instance' => $message->instance,
+            'region' => $message->region,
         ];
+    }
+
+    /**
+     * @param array<string, mixed> $inp
+     *
+     * @return array<string, mixed>
+     */
+    private static function decodeLifecycle(array $inp): array
+    {
+        $event = LifecycleEvent::decode(self::string($inp, 'event'));
+
+        return [
+            'specversion' => $event->specversion,
+            'id' => $event->id,
+            'source' => $event->source,
+            'type' => $event->type,
+            'subject' => $event->subject,
+            'time' => $event->time,
+            'datacontenttype' => $event->datacontenttype,
+            'data' => $event->data,
+            'revision' => $event->revision,
+            'actor' => $event->actor,
+            'instance' => $event->instance,
+            'sequence' => $event->sequence,
+            'replayid' => $event->replayid,
+            'traceparent' => $event->traceparent,
+            'tracestate' => $event->tracestate,
+        ];
+    }
+
+    /**
+     * @return array{status: string, flagged: bool}|null
+     */
+    private static function verificationArray(?Verification $verification): ?array
+    {
+        return $verification === null ? null : ['status' => $verification->status, 'flagged' => $verification->flagged];
     }
 
     /**
@@ -399,6 +485,20 @@ final class ConformanceTest extends TestCase
             : Message::decode(self::string($inp, 'message'));
 
         return ['key' => $hook->idempotencyKey($includeReplay)];
+    }
+
+    /**
+     * @param array<string, mixed> $inp
+     *
+     * @return array{trusted: bool}
+     */
+    private static function trusted(array $inp): array
+    {
+        $hook = \array_key_exists('headers', $inp)
+            ? HookHeaders::fromHeaders(self::stringMap($inp['headers'] ?? null))
+            : Message::decode(self::string($inp, 'message'));
+
+        return ['trusted' => $hook->isTrusted()];
     }
 
     /**

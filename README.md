@@ -21,21 +21,6 @@ pull requests happen in the main repository.
 composer require jamescarr/ankusa
 ```
 
-Until the first release is on Packagist, depend on it as a local path, the same
-way the Elixir packages in this monorepo depend on `ankusa` core before their
-first Hex release:
-
-```json
-{
-    "repositories": [
-        { "type": "path", "url": "../../packages/sdk-php" }
-    ],
-    "require": {
-        "jamescarr/ankusa": "*"
-    }
-}
-```
-
 PHP 8.3 or newer. `guzzlehttp/guzzle` and its PSR-7/PSR-18 interfaces are
 installed as dependencies; any other PSR-18 client can be injected instead.
 
@@ -151,7 +136,58 @@ pass several during a rotation. `$toleranceSeconds` (default 300) bounds the
 `webhook-timestamp` window. Signatures are compared with `hash_equals`;
 failures carry `$errorCode` and `$field`, never retryable.
 
+### Receiving a delivery (signed by default)
+
+Ankusa's HTTP sink signs every delivery unless it is configured
+`allow_unsigned: true`, so a receiver is closed by default.
+`Receiver::receive()` is the one call that decides: with the sink's `$secrets`
+it verifies as above; with none, and no `$allowUnsigned`, it refuses every
+delivery (`InvalidSignatureError`, `$errorCode` `invalid_secret`) — otherwise
+any host that can reach your URL could inject hooks. A configured secret is
+never weakened by `$allowUnsigned`. The signature is judged before the hook
+id, so a delivery that fails it is a `401` even when it also lacks
+`x-ankusa-id` (`MissingHookIdError`, `400`).
+
+```php
+use Ankusa\Webhook\InvalidSignatureError;
+use Ankusa\Webhook\MissingHookIdError;
+use Ankusa\Webhook\Receiver;
+
+try {
+    $received = Receiver::receive(getallheaders(), file_get_contents('php://input'), [getenv('ANKUSA_WHSEC')]);
+    // $received->headers is the HookHeaders; $received->verified is false only
+    // for an unsigned delivery `allowUnsigned: true` let through.
+} catch (InvalidSignatureError $e) {
+    http_response_code(401);
+    echo json_encode(['error' => 'invalid_signature', 'code' => $e->errorCode]);
+    exit;
+} catch (MissingHookIdError) {
+    http_response_code(400);
+    exit;
+}
+```
+
+`$hook->verification` (also on `Receiver::parseHeaders()` and
+`Receiver::decodeMessage()` results) says how the *node* verified the hook at
+ingest, `null` from a node older than the field. `$hook->verification?->flagged
+=== true` means the node accepted a failed check
+(`on_verify_failure: accept_flag`) — treat it as unverified.
+`$hook->isTrusted()` (on `Message`, `HookHeaders` and `Verification`) is that
+decision in one call: `true` only for status `ok` with `flagged` false, so a
+flagged, `failed` or `skipped` hook, or one from a node older than the field,
+is untrusted.
+
 ## Consuming queue messages
+
+The message's `v` is the wire format's major version: `Message::decode()`
+accepts every `v` from `Message::MIN_SUPPORTED_VERSION` to
+`Message::MAX_SUPPORTED_VERSION` (1 and 2) into the one `Message`, with `$v` as
+the wire said it. A `v: 2` message is a `v: 1` message plus additive fields, so
+a consumer reads it the same way; any other `v` is `unsupported_version`
+(permanent: dead-letter it). `$message->instance` and `$message->region` are the
+Ankusa instance that published the message and the region it is configured with
+(`null` for none). A message from the instance's lifecycle sinks carries a
+CloudEvents event as its body: `LifecycleEvent::decode($body)`.
 
 A queue consumer (Redis or a broker; the HTTP sink sends the original body
 plus `x-ankusa-*` headers, read with `HookHeaders`) decodes one v1
@@ -250,8 +286,9 @@ non-JSON success body, or unreachable; retryable).
 ## Admin client
 
 The operator API on `admin.port` (default 4002): health, Prometheus metrics,
-the redacted config, the DLQ, replay jobs, and the quarantine list — the
-`operations`, `dlq`, `replays` and `quarantine` tags of `admin.v1.yaml`.
+the redacted config, the DLQ, replay jobs, the quarantine list, and the audit
+trail — the `operations`, `dlq`, `replays`, `quarantine` and `audit` tags of
+`admin.v1.yaml`.
 
 ```php
 use Ankusa\Admin\AdminClient;
@@ -267,13 +304,20 @@ $job = $admin->createReplay(['kind' => 'dlq', 'source_id' => 'demo', 'rate' => 5
 $admin->getReplay($job['id']);              // the Replay object
 $admin->listReplays();                      // ['replays' => [...]], newest first
 $admin->updateReplay($job['id'], ['state' => 'paused']);  // or 'running'/'cancelled'
+
+// The audit trail, newest first, paged by cursor/limit and filtered by
+// since/until/actor/action/tenant:
+$page = $admin->listAudit(['tenant' => 'acme', 'limit' => 50]);
+$page->entries;       // list<AuditEntry>
+$page->nextCursor;    // pass as `cursor` for the next page; null on the last
 ```
 
 `createReplay()` returns the created job (HTTP 202) or, when an equivalent job
 is already running or paused, that job (HTTP 200) — so a proxy retry is
 idempotent. Methods: `health()`, `metrics()` (Prometheus text), `config()`,
 `listDeadLetters()`, `createReplay()`, `getReplay()`, `listReplays()`,
-`updateReplay()`, `listQuarantined()`. Failures are `AdminError` subclasses:
+`updateReplay()`, `listQuarantined()`, `listAudit()` (returns an `AuditPage` of
+`AuditEntry`). Failures are `AdminError` subclasses:
 `RoleNotEnabledError` (409 `role_not_enabled`, carrying `$role`),
 `AdminRejectedError` (any other 4xx, carrying `$errorCode`),
 and `AdminUnavailableError` (5xx, an unfollowed redirect, or unreachable;
